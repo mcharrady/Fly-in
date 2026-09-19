@@ -12,7 +12,9 @@ class ZoneType(Enum):
     priority = "priority"
 
     def movement_cost(self) -> int:
-        """Return the cost of moving into a zone of this type."""
+        """Find the cost of moving into a zone of this type.
+        Returns:
+            the cost of zone type"""
         costs: dict["ZoneType", int] = {
             ZoneType.normal: 1,
             ZoneType.priority: 1,
@@ -87,10 +89,6 @@ class Zone:
         if not isinstance(other, Zone):
             return False
         return self.name == other.name
-
-    def __hash__(self) -> int:
-        """Return a hash based on the zone's name."""
-        return hash(self.name)
 
 
 class Connection:
@@ -216,7 +214,6 @@ class Drone:
         self.path: list[Zone] = []
         self.path_index: int = 0
         self.status: DroneStatus = DroneStatus.waiting
-        self.turns_waiting: int = 0
         self.in_transit_to: Optional[Zone] = None
 
     def assign_path(self, path: list[Zone]) -> None:
@@ -240,7 +237,6 @@ class Drone:
 
     def wait(self) -> None:
         """Keep the drone in its current zone for one turn."""
-        self.turns_waiting += 1
         self.status = DroneStatus.waiting
 
     def has_arrived(self, goal: Zone) -> bool:

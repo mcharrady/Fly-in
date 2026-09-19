@@ -9,12 +9,17 @@ def main() -> int:
     Returns:
         Process exit code: 0 on success, 1 on any error.
     """
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3):
         print(
             "Usage: python3 main.py <map_file>",
             file=sys.stderr
         )
         return 1
+    flag = False
+    if len(sys.argv) == 3:
+        if sys.argv[2] == "--flag":
+            flag = True
+        
     map_file = sys.argv[1]
     try:
         parser = Parser()

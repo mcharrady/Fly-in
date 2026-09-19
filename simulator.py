@@ -1,162 +1,188 @@
-"""Pathfinding, scheduling, and turn-by-turn simulation of drone delivery."""
+"""Pathfinding, scheduling, and turn-by-turn simulation of drone
+delivery.
+"""
 import heapq
-from typing import Optional
-from models import Zone, ZoneType, Graph, Drone, DroneStatus
+from models import Zone, ZoneType, Connection, Graph, Drone, DroneStatus
 from visualisor import Visualisor
 
 
 class PathNotFoundError(Exception):
     """Raised when no valid path exists from a drone to the goal zone."""
-    def __init__(self, goal: Zone):
+    def __init__(self, goal: Zone) -> None:
         """Initialize a PathNotFoundError.
+
         Args:
             goal: The zone that could not be reached.
         """
-        self.goal = goal
-        super().__init__(
-           f"No path found to '{goal.name}'"
+        super().__init__(f"No path found to '{goal.name}'")
+
+
+class Occupancy:
+    """Tracks how full each zone and connection is for one turn."""
+    def __init__(self) -> None:
+        """Initialize with nothing claimed yet."""
+        self.zone_counts: dict[str, int] = {}
+        self.connection_counts: dict[str, int] = {}
+
+    def zone_count(self, zone: Zone) -> int:
+        """:
+        """
+        return self.zone_counts.get(zone.name, 0)
+
+    def is_zone_full(self, zone: Zone) -> bool:
+        """
+        """
+        return self.zone_count(zone) >= zone.max_drones
+
+    def claim_zone(self, zone: Zone) -> None:
+        """Reserve one slot in a zone for this turn.
+        Args:
+        """
+        self.zone_counts[zone.name] = self.zone_count(zone) + 1
+
+    def release_zone(self, zone: Zone) -> None:
+        """Free one slot in a zone, e.g. when a drone is leaving it.
+        Args:
+        """
+        current = self.zone_count(zone)
+        self.zone_counts[zone.name] = max(0, current - 1)
+
+    def connection_count(self, connection: Connection) -> int:
+        """."""
+        return self.connection_counts.get(connection.name, 0)
+
+    def is_connection_full(self, connection: Connection) -> bool:
+        """."""
+        return (
+            self.connection_count(connection)
+            >= connection.max_link_capacity
+        )
+
+    def claim_connection(self, connection: Connection) -> None:
+        """Reserve one slot on a connection for this turn.
+        Args:
+        """
+        self.connection_counts[connection.name] = (
+            self.connection_count(connection) + 1
         )
 
 
-class ZoneOccupancy:
-    """Tracks how many drones currently occupy each zone.."""
-    def __init__(self) -> None:
-        """Initialize empty occupancy counts."""
-        self.counts: dict[str, int] = {}
-
-    def set(self, zone_name: str, count: int) -> None:
-        """Set the occupancy count for a zone."""
-        self.counts[zone_name] = count
-
-    def get(self, zone_name: str) -> int:
-        """Return the occupancy count for a zone, defaulting to 0."""
-        return self.counts.get(zone_name, 0)
-
-    def is_full(self, zone: Zone) -> bool:
-        """Return True if a zone has reached its maximum drone capacity."""
-        return self.get(zone.name) >= zone.max_drones
-
-
 class Pathfinder:
-    """Finds shortest paths for drones through the graph using Dijkstra."""
+    """Finds the cheapest currently-available path for a drone."""
     count = 1
 
     def __init__(self, graph: Graph) -> None:
         """Initialize the pathfinder for a given graph.
+
         Args:
-            graph: The graph to route drones through."""
-        self.graph = graph
-        self.planned_usage: dict[str, int] = {}
-
-    def register_path(self, path: list[Zone]) -> None:
-        """Record the zones of a path to
-            penalize congestion in future routes.
+            graph: The graph to route drones through.
         """
-        for zone in path:
-            self.planned_usage[zone.name] = (
-                self.planned_usage.get(zone.name, 0) + 1
-            )
+        self.graph = graph
 
-    def usage_penalty(self, zone: Zone) -> float:
-        """Return the congestion penalty for a zone based on planned usage."""
-        penalty_per_drone = 2.0
-        return self.planned_usage.get(zone.name, 0) * penalty_per_drone
+    def priority_bonus(self, zone: Zone) -> int:
+        """."""
+        return 0 if zone.zone_type == ZoneType.priority else 1
 
-    def zone_cost(
-        self, zone: Zone, occupancy: ZoneOccupancy,
-        avoid: Optional[set[str]] = None,
-        is_immediate: bool = False
-    ) -> float:
-        """Return the cost of moving into a zone.
+    def move_cost(
+            self, zone: Zone, connection: Connection,
+            occupancy: Occupancy, is_immediate: bool
+            ) -> float:
+        """Return the cost of moving into a zone through a connection.
+
         Args:
             zone: The zone being entered.
-            occupancy: Current zone occupancy counts.
-            avoid: Zone names to treat as impassable, if this is an
-                immediate move.
+            connection: The connection used to reach it.
+            occupancy: Current zone and connection usage.
             is_immediate: Whether this is the drone's very next move.
+
         Returns:
-            The movement cost, or float('inf') if the zone can't be
-            entered.
+            The movement cost, or float('inf') if the move can't
+            happen right now.
         """
         if zone.zone_type == ZoneType.blocked:
             return float("inf")
         if is_immediate:
-            if avoid and zone.name in avoid:
-                if not zone.zone_type == ZoneType.priority:
-                    return float("inf")
-            if occupancy.is_full(zone):
+            if occupancy.is_zone_full(zone):
+                return float("inf")
+            if occupancy.is_connection_full(connection):
                 return float("inf")
         cost = float(zone.movement_cost())
-        if not is_immediate and occupancy.is_full(zone):
-            cost += 2.0
-        cost += self.usage_penalty(zone)
+        if not is_immediate:
+            if occupancy.is_zone_full(zone):
+                cost += 2.0
+            if occupancy.is_connection_full(connection):
+                cost += 2.0
         return cost
 
-    def priority_bonus(self, zone: Zone) -> int:
-        """Return a tie-breaking bonus, lower for priority zones."""
-        return 0 if zone.zone_type == ZoneType.priority else 1
-
     def find_path(
-        self, drone: Drone,
-        occupancy: ZoneOccupancy,
-        avoid: Optional[set[str]] = None
-    ) -> list[Zone]:
-        """Find the shortest path from the drone's zone to the goal.
+            self, drone: Drone, occupancy: Occupancy
+            ) -> list[Zone]:
+        """Find the cheapest path from the drone's zone to the goal.
+
         Args:
             drone: The drone to route.
-            occupancy: Current zone occupancy counts.
-            avoid: Zone names the drone's first move must not enter.
+            occupancy: Current zone and connection usage.
+
         Returns:
             The list of zones forming the path, including the start
             and goal.
+
         Raises:
-            PathNotFoundError: If no path to the goal exists.
+            PathNotFoundError: If no path to the goal exists right now.
         """
         assert self.graph.end_zone is not None
         start = drone.current_zone
         goal = self.graph.end_zone
         if start == goal:
             return [start]
-        initial_bonus = self.priority_bonus(start)
         heap: list[tuple[float, int, int, str, list[Zone]]] = [
-            (0, initial_bonus, self.count, start.name, [start])
+            (
+                0, self.priority_bonus(start),
+                self.count, start.name, [start]
+            )
         ]
         visited: set[str] = set()
         while heap:
-            cost, bonus, _, zone_name, path = heapq.heappop(heap)
+            cost, _, _, zone_name, path = heapq.heappop(heap)
             if zone_name in visited:
                 continue
             visited.add(zone_name)
             current_zone = self.graph.zones[zone_name]
             if current_zone == goal:
                 return path
-            for neighbor, _ in self.graph.get_neighbors(current_zone):
+            is_immediate = (current_zone == start)
+            for neighbor, Connection in self.graph.get_neighbors(current_zone):
                 if neighbor.name in visited:
                     continue
-                is_immediate = (current_zone == start)
-                move_cost = self.zone_cost(
-                    neighbor, occupancy, avoid, is_immediate)
+                move_cost = self.move_cost(
+                    neighbor, Connection, occupancy, is_immediate
+                )
                 if move_cost == float("inf"):
                     continue
                 self.count += 1
-                new_cost = cost + move_cost
-                bonus = self.priority_bonus(neighbor)
-                new_path = path + [neighbor]
                 heapq.heappush(
                     heap,
-                    (new_cost, bonus, self.count, neighbor.name, new_path)
+                    (
+                        cost + move_cost,
+                        self.priority_bonus(neighbor),
+                        self.count,
+                        neighbor.name,
+                        path + [neighbor]
+                    )
                 )
+            
         raise PathNotFoundError(goal)
 
 
 class Move:
     """A single drone's action for one simulation turn."""
     def __init__(
-        self, drone: Drone, next_zone: Zone,
-        is_waiting: bool = False, is_transit: bool = False,
-        connection_name: str = ""
-    ) -> None:
+            self, drone: Drone, next_zone: Zone,
+            is_waiting: bool = False, is_transit: bool = False,
+            connection_name: str = "" 
+        ) -> None:
         """Initialize a Move.
+
         Args:
             drone: The drone performing this move.
             next_zone: The zone the drone is moving to (or staying in).
@@ -185,321 +211,183 @@ class Move:
 
 
 class Scheduler:
-    """Resolves conflicting drone move requests turn by turn."""
-
+    """Decides every drone's move for one turn, one drone at a time."""
     def __init__(self, pathfinder: Pathfinder) -> None:
         """Initialize the scheduler.
+
         Args:
-            pathfinder: Used to reroute drones whose move is rejected.
+            pathfinder: Used to find each drone's path when it has none.
         """
         self.pathfinder = pathfinder
 
-    def resolve(
-        self, drones: list[Drone],
-        occupancy: ZoneOccupancy
-    ) -> list[Move]:
-        """Compute the approved moves for all active drones this turn.
-        Args:
-            drones: Drones that are not yet delivered.
-            occupancy: Current zone occupancy counts.
-        Returns:
-            The list of moves to apply this turn, one per drone.
-        """
-        intentions: dict[int, Optional[Zone]] = {}
-        for drone in drones:
-            if drone.status == DroneStatus.in_transit:
-                continue
-            intentions[drone.id] = drone.next_zone()
+    def resolve(self, drones: list[Drone], occupancy: Occupancy) -> list[Move]:
+        """Decide each drone's move for this turn.
 
-        approved: dict[int, Zone] = {}
-        connection_usage: dict[str, int] = {}
-        avoided: dict[int, set[str]] = {
-            d.id: set() for d in drones
-            if d.status != DroneStatus.in_transit
-        }
-        pending = [
-            d for d in drones
-            if intentions.get(d.id) is not None
-        ]
-        max_rounds = len(drones) * 2 + 2
-        for _ in range(max_rounds):
-            if not pending:
-                break
-            failed = self.approve_round(
-                pending, drones, intentions, approved,
-                connection_usage, occupancy
-            )
-            if len(failed) < len(pending):
-                pending = failed
-                continue
-            progressed = False
-            adjusted = self.adjusted_occupancy(
-                occupancy, drones, approved, intentions
-            )
-            for drone in failed:
-                target = intentions[drone.id]
-                if target is not None:
-                    avoided[drone.id].add(target.name)
-                alt = self.find_alternate_target(
-                    drone, adjusted, avoided[drone.id]
-                )
-                if alt is not None:
-                    intentions[drone.id] = alt
-                    progressed = True
-            if not progressed:
-                break
-            pending = failed
-        moves = self.build_moves(drones, approved)
-        return moves
+        Each drone plans its full route to the goal once, the first
+        time it needs one, and then just follows it hop by hop. If
+        the next hop is blocked this turn (zone or connection full),
+        the drone waits and tries the same hop again next turn — it
+        never abandons a working plan just because of a temporary
+        block.
 
-    def adjusted_occupancy(
-        self, occupancy: ZoneOccupancy, all_drones: list[Drone],
-        approved: dict[int, Zone],
-        intentions: dict[int, Optional[Zone]]
-    ) -> ZoneOccupancy:
-        """Return zone occupancy adjusted for drones about to leave.
         Args:
-            occupancy: Current zone occupancy counts.
-            all_drones: All active drones.
-            approved: Moves already approved this round.
-            intentions: Each drone's intended next zone.
-        Returns:
-            A new ZoneOccupancy with departing drones subtracted out.
-        """
-        adjusted = ZoneOccupancy()
-        for zone_name, count in occupancy.counts.items():
-            leaving = sum(
-                1 for d in all_drones
-                if d.current_zone.name == zone_name
-                and d.id in approved
-                and intentions[d.id] != d.current_zone
-            )
-            adjusted.set(zone_name, max(0, count - leaving))
-        return adjusted
+            drones: Drones to move this turn (not delivered, not
+                already mid-transit).
+            occupancy: Zone/connection usage at the start of the turn;
+                claims are added to it as drones are assigned.
 
-    def approve_round(
-        self, pending: list[Drone], all_drones: list[Drone],
-        intentions: dict[int, Optional[Zone]],
-        approved: dict[int, Zone],
-        connection_usage: dict[str, int],
-        occupancy: ZoneOccupancy
-    ) -> list[Drone]:
-        """Approve as many pending drone moves as capacity allows.
-        Args:
-            pending: Drones still waiting for approval this round.
-            all_drones: All active drones.
-            intentions: Each drone's intended next zone.
-            approved: Moves approved so far; updated in place.
-            connection_usage: Connection usage counts; updated in place.
-            occupancy: Current zone occupancy counts.
         Returns:
-            The drones whose move could not be approved this round.
-        """
-        zone_requests: dict[str, list[Drone]] = {}
-        for drone in sorted(pending, key=lambda d: d.id):
-            target = intentions[drone.id]
-            if target is not None:
-                zone_requests.setdefault(target.name, []).append(drone)
-        newly_approved: set[int] = set()
-        for zone_name, competing in zone_requests.items():
-            zone = self.pathfinder.graph.zones[zone_name]
-            leaving = sum(
-                1 for d in all_drones
-                if d.current_zone.name == zone_name
-                and d.id in approved
-                and intentions[d.id] != d.current_zone
-            )
-            already_in = sum(
-                1 for z in approved.values() if z.name == zone_name
-            )
-            current_count = occupancy.get(zone_name)
-            available_slots = (
-                zone.max_drones - current_count + leaving - already_in
-            )
-            for drone in competing:
-                if available_slots > 0:
-                    connection = self.pathfinder.graph.get_connection(
-                        drone.current_zone, zone
-                    )
-                    if connection is None:
-                        continue
-                    conn_name = connection.name
-                    used = connection_usage.get(conn_name, 0)
-                    if used < connection.max_link_capacity:
-                        approved[drone.id] = zone
-                        newly_approved.add(drone.id)
-                        available_slots -= 1
-                        connection_usage[conn_name] = used + 1
-        failed: list[Drone] = []
-        for drone in pending:
-            if drone.id not in newly_approved:
-                failed.append(drone)
-        return failed
-
-    def find_alternate_target(
-        self, drone: Drone, occupancy: ZoneOccupancy,
-        avoid_zone_name: set[str]
-    ) -> Optional[Zone]:
-        """Find an alternate next zone for a drone whose move was rejected.
-        Args:
-            drone: The drone to reroute.
-            occupancy: Current zone occupancy counts.
-            avoid_zone_name: Zone names the drone's next move must avoid.
-        Returns:
-            The drone's new next zone, or None if no alternate route
-                exists.
-        """
-        try:
-            new_path = self.pathfinder.find_path(
-                drone, occupancy, avoid=avoid_zone_name
-            )
-        except PathNotFoundError:
-            return None
-        if len(new_path) < 2:
-            return None
-        drone.assign_path(new_path)
-        return drone.next_zone()
-
-    def build_moves(
-        self, drones: list[Drone], approved: dict[int, Zone]
-    ) -> list[Move]:
-        """Build the final list of Move objects from approved targets.
-        Args:
-            drones: Active drones.
-            approved: Each approved drone's next zone.
-        Returns:
-            One Move per drone: a real move, a transit, or a wait.
+            One move per drone.
         """
         moves: list[Move] = []
-        for drone in drones:
-            if drone.status == DroneStatus.in_transit:
-                continue
-            if drone.id in approved:
-                target = approved[drone.id]
-                is_transit = target.is_restricted()
-                connection_name = ""
-                if is_transit:
-                    connection = self.pathfinder.graph.get_connection(
-                        drone.current_zone, target
-                    )
-                    if connection is not None:
-                        connection_name = connection.name
+        for drone in sorted(drones, key=lambda d: d.id):
+            if drone.next_zone() is None:
+                try:
+                    path = self.pathfinder.find_path(drone, occupancy)
+                except PathNotFoundError:
+                    moves.append(Move(
+                        drone=drone, next_zone=drone.current_zone,
+                        is_waiting=True
+                    ))
+                    continue
+                if len(path) < 2:
+                    moves.append(Move(
+                        drone=drone, next_zone=drone.current_zone,
+                        is_waiting=True
+                    ))
+                    continue
+                drone.assign_path(path)
+            next_zone = drone.next_zone()
+            assert next_zone is not None
+            connection = self.pathfinder.graph.get_connection(
+                drone.current_zone, next_zone
+            )
+            assert connection is not None
+            blocked = self.pathfinder.move_cost(
+                next_zone, connection, occupancy, is_immediate=True
+            ) == float("inf")
+            if blocked:
                 moves.append(Move(
-                    drone=drone,
-                    next_zone=target,
-                    is_transit=is_transit,
-                    connection_name=connection_name
-                ))
-            else:
-                moves.append(Move(
-                    drone=drone,
-                    next_zone=drone.current_zone,
+                    drone=drone, next_zone=drone.current_zone,
                     is_waiting=True
                 ))
+                continue
+            occupancy.release_zone(drone.current_zone)
+            occupancy.claim_zone(next_zone)
+            if connection is not None:
+                occupancy.claim_connection(connection)
+            is_transit = next_zone.is_restricted()
+            connection_name = (
+                connection.name if is_transit and connection is not None
+                else ""
+            )
+            moves.append(Move(
+                drone=drone, next_zone=next_zone,
+                is_transit=is_transit, connection_name=connection_name
+            ))
         return moves
 
 
 class Simulator:
     """Runs the drone delivery simulation until all drones are delivered."""
+
     def __init__(self, graph: Graph, drones: list[Drone]) -> None:
-        """Initialize the simulator and compute each drone's first path.
+        """Initialize the simulator and confirm every drone can reach the goal.
+
         Args:
             graph: The map graph to simulate on.
             drones: The drones to deliver.
+
+        Raises:
+            PathNotFoundError: If any drone cannot reach the goal at
+                all, ignoring congestion.
         """
         self.graph = graph
         self.drones = drones
         self.pathfinder = Pathfinder(self.graph)
         self.scheduler = Scheduler(self.pathfinder)
         self.visualiser = Visualisor()
-        self.occupancy = ZoneOccupancy()
         self.turn = 0
         for drone in self.drones:
-            path = self.pathfinder.find_path(drone, self. occupancy)
-            drone.assign_path(path)
-            if len(drones) <= 20:
-                self.pathfinder.register_path(path)
+            self.pathfinder.find_path(drone, Occupancy())
 
     def active_drones(self) -> list[Drone]:
         """Return drones that have not yet been delivered."""
-        return [
-            d for d in self.drones
-            if d.status != DroneStatus.delivered
-        ]
+        return [d for d in self.drones if d.status != DroneStatus.delivered]
 
     def all_delivered(self) -> bool:
         """Return True if every drone has reached the end zone."""
-        return all(
-            d.status == DroneStatus.delivered
-            for d in self.drones
-        )
+        return all(d.status == DroneStatus.delivered for d in self.drones)
 
-    def update_occupancy(self) -> None:
-        """Recompute zone occupancy counts from current drone positions."""
-        new_counts: dict[str, int] = {}
+    def build_occupancy(self) -> Occupancy:
+        """Build a fresh Occupancy snapshot from current drone positions.
+        
+        Returns:
+        """
+        occupancy = Occupancy()
         for drone in self.drones:
-            if drone.status == DroneStatus.delivered:
-                continue
-            if drone.status == DroneStatus.in_transit:
+            if drone.status in (DroneStatus.delivered, DroneStatus.in_transit):
+                if drone.status == DroneStatus.in_transit and drone.in_transit_to:
+                    conn = self.graph.get_connection(drone.current_zone, drone.in_transit_to)
+                    if conn:
+                        occupancy.claim_connection(conn)
                 continue
             zone_name = drone.current_zone.name
-            new_counts[zone_name] = new_counts.get(zone_name, 0) + 1
-        for zone_name, count in new_counts.items():
-            self.occupancy.set(zone_name, count)
-        for zone_name in self.occupancy.counts:
-            if zone_name not in new_counts:
-                self.occupancy.set(zone_name, 0)
+            occupancy.zone_counts[zone_name] = (
+                occupancy.zone_counts.get(zone_name, 0) + 1
+            )
+        return occupancy
 
-    def print_turn(
-        self, moved: list[Move], turn: int,
-    ) -> None:
+    def print_turn(self, moved: list[Move], turn: int) -> None:
         """Print the moves made during a turn.
+
         Args:
             moved: The moves that took place this turn.
             turn: The current turn number.
-            occupancy: Current zone occupancy counts.
         """
-        print(f"{self.visualiser.render_turn(moved, self.graph)}")
+        # print(f"Turn{turn}:", end=" ")
+        print(self.visualiser.render_turn(moved, self.graph))
 
     def step(self, turn: int) -> None:
         """Advance the simulation by one turn.
+
         Args:
-            turn: The current turn number."""
+            turn: The current turn number.
+        """
         assert self.graph.end_zone is not None
         active = self.active_drones()
-        moves = self.scheduler.resolve(active, self.occupancy)
         moved: list[Move] = []
+        remaining: list[Drone] = []
+        occupancy = self.build_occupancy()
         for drone in active:
             if (
                 drone.status == DroneStatus.in_transit
                 and drone.in_transit_to is not None
             ):
                 drone.advance()
-                moved.append(Move(
-                    drone=drone,
-                    next_zone=drone.current_zone
-                ))
-        arrived_ids = {m.drone.id for m in moved}
-        for move in moves:
-            if move.drone.id in arrived_ids:
-                continue
+                moved.append(Move(drone=drone, next_zone=drone.current_zone))
+            else:
+                remaining.append(drone)
+
+        for move in self.scheduler.resolve(remaining, occupancy):
+            drone = move.drone
             if move.is_real_move():
                 if move.is_transit:
-                    move.drone.status = DroneStatus.in_transit
-                    move.drone.in_transit_to = move.next_zone
+                    drone.status = DroneStatus.in_transit
+                    drone.in_transit_to = move.next_zone
                 else:
-                    move.drone.advance()
+                    drone.advance()
                 moved.append(move)
             else:
-                move.drone.wait()
+                drone.wait()
         for drone in active:
             if drone.has_arrived(self.graph.end_zone):
                 drone.status = DroneStatus.delivered
-        self.update_occupancy()
         self.print_turn(moved, turn)
 
     def run(self) -> int:
         """Run the simulation until every drone is delivered.
+
         Returns:
             The total number of turns taken.
         """
